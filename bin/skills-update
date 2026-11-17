@@ -1,0 +1,249 @@
+#!/usr/bin/env node
+// skills-update: update every agent skill that has an upstream source, for every agent.
+//
+//   skills-update            update everything now
+//   skills-update auto on    run daily via launchd (default 10:00, or --at HH:MM)
+//   skills-update auto off   remove the schedule
+//   skills-update auto status
+//   skills-update log        show the scheduled runs' log
+//
+// Per agent (skipped when the agent isn't installed):
+//   - Claude Code: plugin marketplaces and every installed plugin
+//   - Codex: plugin marketplaces
+//   - Gemini CLI: extensions
+//   - all agents: skill folders that are git clones (see AGENTS for the folders)
+// Cross-agent installers: the `skills` CLI (npx skills add) and `gh skill`.
+// claude.ai-synced skills are managed by claude.ai and skipped.
+
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const HOME = homedir();
+const LABEL = "local.skills-update";
+const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
+const LOG = join(HOME, "Library/Logs/skills-update.log");
+const SKIP_DIRS = new Set(["synced", ".trash", ".system"]);
+
+// Each agent's user-level skill folders, and its own updater when it has one.
+const AGENTS = [
+  { name: "Claude Code", bin: "claude", dirs: [".claude/skills"], update: updateClaudePlugins },
+  { name: "Codex", bin: "codex", dirs: [".codex/skills"], update: updateCodexPlugins },
+  { name: "Gemini CLI", bin: "gemini", dirs: [".gemini/skills"], update: updateGeminiExtensions },
+  { name: "OpenCode", bin: "opencode", dirs: [".config/opencode/skills", ".config/opencode/skill"] },
+  { name: "Cursor", bin: "cursor-agent", dirs: [".cursor/skills"] },
+  { name: "GitHub Copilot", bin: "copilot", dirs: [".copilot/skills"] },
+  { name: "Windsurf", bin: "windsurf", dirs: [".codeium/windsurf/skills"] },
+  { name: "Antigravity", bin: "antigravity", dirs: [".gemini/antigravity/skills"] },
+  // Read by Codex, OpenCode, Zed, Cline, Warp and others.
+  { name: "Shared", dirs: [".agents/skills"] },
+];
+
+const results = [];
+
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 300_000, cwd: HOME, ...opts });
+  return {
+    ok: r.status === 0,
+    missing: r.error?.code === "ENOENT",
+    out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim(),
+  };
+}
+
+function has(bin) {
+  return Boolean(bin) && run("which", [bin]).ok;
+}
+
+function record(name, status, detail = "") {
+  results.push({ name, status, detail });
+  const mark = { updated: "↑", current: "✓", skipped: "–", failed: "✗" }[status];
+  console.log(`${mark} ${name}${detail ? `: ${detail}` : ""}`);
+}
+
+function lastLine(text) {
+  return text.split("\n").filter(Boolean).at(-1) ?? "";
+}
+
+function updateClaudePlugins() {
+  const mk = run("claude", ["plugin", "marketplace", "update"]);
+  record("Claude Code marketplaces", mk.ok ? "current" : "failed", mk.ok ? "refreshed" : lastLine(mk.out));
+
+  const list = run("claude", ["plugin", "list", "--json"]);
+  let plugins = [];
+  try {
+    plugins = JSON.parse(list.out);
+  } catch {
+    return record("Claude Code plugin list", "failed", lastLine(list.out));
+  }
+
+  for (const p of plugins) {
+    const name = `Claude Code plugin ${p.id} (${p.scope})`;
+    const cwd = p.projectPath ?? HOME;
+    if (p.scope !== "user" && !p.projectPath) {
+      record(name, "skipped", "project-scoped; run from that project");
+      continue;
+    }
+    const r = run("claude", ["plugin", "update", p.id, "--scope", p.scope, "--json"], { cwd });
+    let res;
+    try {
+      res = JSON.parse(lastLine(r.out));
+    } catch {
+      record(name, "failed", lastLine(r.out));
+      continue;
+    }
+    if (res.updateOutcome === "up_to_date") record(name, "current", res.newVersion);
+    else if (res.outcome === "ok") record(name, "updated", `${res.oldVersion} → ${res.newVersion} (restart Claude Code)`);
+    else if (res.shownCommand) record(name, "skipped", "update runs a marketplace command; run `claude plugin update` by hand to review it");
+    else record(name, "failed", res.message ?? lastLine(r.out));
+  }
+}
+
+function updateCodexPlugins() {
+  const r = run("codex", ["plugin", "marketplace", "upgrade"]);
+  if (!r.ok) return record("Codex marketplaces", "failed", lastLine(r.out));
+  if (/No configured Git marketplaces/i.test(r.out)) return record("Codex marketplaces", "skipped", "none configured");
+  record("Codex marketplaces", "current", `${lastLine(r.out)} (restart Codex)`);
+}
+
+function updateGeminiExtensions() {
+  const r = run("gemini", ["extensions", "update", "--all"]);
+  if (!r.ok) return record("Gemini CLI extensions", "failed", lastLine(r.out));
+  record("Gemini CLI extensions", /updated/i.test(r.out) ? "updated" : "current", lastLine(r.out));
+}
+
+function updateSkillsCli() {
+  // `skills` keeps its global lock in ~/.agents; without tracked skills there is nothing to do.
+  const r = run("pnpm", ["dlx", "skills", "update", "-g", "-y"]);
+  if (r.missing) return record("skills CLI", "skipped", "pnpm not found");
+  if (!r.ok) return record("skills CLI", "failed", lastLine(r.out));
+  if (/No global skills tracked/i.test(r.out)) return record("skills CLI", "skipped", "no tracked global skills");
+  record("skills CLI", /updated/i.test(r.out) ? "updated" : "current", lastLine(r.out.replace(/\nDone in .*$/s, "")));
+}
+
+function updateGhSkills() {
+  // Scans every agent's skill folders; skills without GitHub metadata are skipped with a notice.
+  if (!has("gh")) return record("gh skill", "skipped", "gh not found");
+  const r = run("gh", ["skill", "update", "--all"]);
+  if (!r.ok) return record("gh skill", "failed", lastLine(r.out));
+  if (/All skills are up to date/i.test(r.out)) return record("gh skill", "current", "all up to date");
+  record("gh skill", "updated", lastLine(r.out));
+}
+
+function pullGitSkill(dir, agent) {
+  const name = `${agent} git skill ${dir.replace(HOME, "~")}`;
+  if (run("git", ["-C", dir, "status", "--porcelain"]).out) return record(name, "skipped", "local changes");
+  const before = run("git", ["-C", dir, "rev-parse", "HEAD"]).out;
+  const pull = run("git", ["-C", dir, "pull", "--ff-only", "--quiet"]);
+  if (!pull.ok) return record(name, "failed", lastLine(pull.out));
+  const after = run("git", ["-C", dir, "rev-parse", "HEAD"]).out;
+  record(name, before === after ? "current" : "updated", after.slice(0, 7));
+}
+
+function updateGitSkills(agent, dirs, seen) {
+  for (const rel of dirs) {
+    const base = join(HOME, rel);
+    if (!existsSync(base)) continue;
+    // A whole skills folder can be one clone, or each skill can be its own.
+    const candidates = existsSync(join(base, ".git"))
+      ? [base]
+      : readdirSync(base)
+          .filter((entry) => !SKIP_DIRS.has(entry))
+          .map((entry) => join(base, entry))
+          .filter((dir) => statSync(dir, { throwIfNoEntry: false })?.isDirectory() && existsSync(join(dir, ".git")));
+    for (const dir of candidates) {
+      const real = realpathSync(dir);
+      if (seen.has(real)) continue;
+      seen.add(real);
+      pullGitSkill(dir, agent);
+    }
+  }
+}
+
+function updateAll() {
+  console.log(`skills-update ${new Date().toISOString()}`);
+  const seen = new Set();
+  const found = [];
+  for (const agent of AGENTS) {
+    const installed = has(agent.bin);
+    const hasDirs = agent.dirs.some((d) => existsSync(join(HOME, d)));
+    if (!installed && !hasDirs) continue;
+    found.push(agent.name);
+    if (installed) agent.update?.();
+    updateGitSkills(agent.name, agent.dirs, seen);
+  }
+  updateSkillsCli();
+  updateGhSkills();
+  const count = (s) => results.filter((r) => r.status === s).length;
+  console.log(`\nAgents: ${found.join(", ")}`);
+  console.log(`${count("updated")} updated, ${count("current")} current, ${count("skipped")} skipped, ${count("failed")} failed`);
+  process.exitCode = count("failed") ? 1 : 0;
+}
+
+function plist(hour, minute) {
+  const path = [join(HOME, ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].join(":");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${process.execPath}</string>
+    <string>${process.argv[1]}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>${path}</string></dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>${hour}</integer><key>Minute</key><integer>${minute}</integer></dict>
+  <key>StandardOutPath</key><string>${LOG}</string>
+  <key>StandardErrorPath</key><string>${LOG}</string>
+</dict>
+</plist>
+`;
+}
+
+function auto(action, args) {
+  if (process.platform !== "darwin") throw new Error("auto uses launchd and only works on macOS; schedule `skills-update` with cron instead");
+  const domain = `gui/${process.getuid()}`;
+  if (action === "on") {
+    const at = args.includes("--at") ? args[args.indexOf("--at") + 1] : "10:00";
+    const [hour, minute] = (at ?? "").split(":").map(Number);
+    if (!(hour >= 0 && hour < 24 && minute >= 0 && minute < 60)) throw new Error("--at expects HH:MM");
+    mkdirSync(join(HOME, "Library/LaunchAgents"), { recursive: true });
+    run("launchctl", ["bootout", `${domain}/${LABEL}`]);
+    writeFileSync(PLIST, plist(hour, minute));
+    const r = run("launchctl", ["bootstrap", domain, PLIST]);
+    if (!r.ok) throw new Error(`launchctl bootstrap failed: ${r.out}`);
+    console.log(`Auto-update on: daily at ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}. Log: ${LOG}`);
+  } else if (action === "off") {
+    run("launchctl", ["bootout", `${domain}/${LABEL}`]);
+    rmSync(PLIST, { force: true });
+    console.log("Auto-update off.");
+  } else if (action === "status") {
+    const loaded = run("launchctl", ["print", `${domain}/${LABEL}`]).ok;
+    console.log(loaded ? `Auto-update on (${PLIST})` : "Auto-update off");
+    if (existsSync(LOG)) {
+      const lines = readFileSync(LOG, "utf8").split("\n");
+      const started = lines.findLast((l) => l.startsWith("skills-update "))?.slice("skills-update ".length);
+      const summary = lines.findLast((l) => / updated, \d+ current/.test(l));
+      console.log(`Last run: ${started ?? "unknown"}${summary ? ` (${summary})` : ""}`);
+    }
+  } else {
+    throw new Error("usage: skills-update auto on [--at HH:MM] | off | status");
+  }
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+try {
+  if (!cmd || cmd === "run") updateAll();
+  else if (cmd === "auto") auto(rest[0], rest.slice(1));
+  else if (cmd === "log") console.log(existsSync(LOG) ? readFileSync(LOG, "utf8") : "No log yet.");
+  else if (cmd === "-h" || cmd === "--help" || cmd === "help") {
+    const src = readFileSync(process.argv[1], "utf8").split("\n");
+    console.log(src.slice(1, src.findIndex((l) => l.startsWith("import "))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n").trim());
+  } else throw new Error(`unknown command: ${cmd} (try --help)`);
+} catch (err) {
+  console.error(`skills-update: ${err.message}`);
+  process.exitCode = 2;
+}
