@@ -25,7 +25,7 @@ Agents that aren't installed are skipped.
 | Claude Code | plugin marketplaces and every installed plugin (`claude plugin update`) |
 | Codex | Git plugin marketplaces (`codex plugin marketplace upgrade`) |
 | Gemini CLI | extensions (`gemini extensions update --all`) |
-| All agents | skill folders that are git clones, in `~/.claude/skills`, `~/.codex/skills`, `~/.gemini/skills`, `~/.config/opencode/skills`, `~/.cursor/skills`, `~/.copilot/skills`, `~/.codeium/windsurf/skills`, `~/.gemini/antigravity/skills` and `~/.agents/skills` |
+| All agents | skill folders that are git clones, in `~/.claude/skills`, `~/.codex/skills`, `~/.gemini/skills`, `~/.config/opencode/skills`, `~/.config/opencode/skill`, `~/.cursor/skills`, `~/.copilot/skills`, `~/.codeium/windsurf/skills`, `~/.gemini/antigravity/skills` and `~/.agents/skills` |
 | All agents | skills installed with the [`skills`](https://github.com/vercel-labs/skills) CLI (`skills update -g`, run through `pnpm dlx`) |
 | All agents | skills installed with `gh skill install` (`gh skill update --all`) |
 
